@@ -1,126 +1,123 @@
-from functools import reduce
-from operator import add
-
-from config import get_logger
 from pyspark.sql import DataFrame
-from pyspark.sql.functions import col, concat_ws, expr, lit, size, to_date, when
+from pyspark.sql.functions import array, col, concat_ws, expr, size, to_date, when
+from pyspark.sql.functions import filter as spark_filter
 from pyspark.sql.types import DoubleType
-
-logger = get_logger(__name__)
 
 
 def clean_movie_data(df: DataFrame) -> DataFrame:
-    logger.info("Starting data cleaning with PySpark...")
-    movies_df = df
+    columns = set(df.columns)
 
     # Drop irrelevant columns
-    columns_to_drop = [
+    drop_cols = {
         "adult",
         "imdb_id",
         "original_title",
         "video",
         "homepage",
         "backdrop_path",
-    ]
-    movies_df = movies_df.drop(*[c for c in columns_to_drop if c in movies_df.columns])
+    }
+    movies_df = df.drop(*drop_cols.intersection(columns))
 
-    # Extract nested data
+    # Flatten nested fields
+    select_exprs = ["*"]
 
-    # belongs_to_collection.name
-    if "belongs_to_collection" in movies_df.columns:
-        movies_df = movies_df.withColumn(
-            "belongs_to_collection", col("belongs_to_collection.name")
+    if "belongs_to_collection" in columns:
+        select_exprs.append(
+            col("belongs_to_collection.name").alias("belongs_to_collection")
         )
 
-    # genres
-    if "genres" in movies_df.columns:
-        movies_df = movies_df.withColumn("genres", concat_ws("|", col("genres.name")))
+    if "genres" in columns:
+        select_exprs.append(concat_ws("|", col("genres.name")).alias("genres"))
 
-    # spoken_languages
-    if "spoken_languages" in movies_df.columns:
-        movies_df = movies_df.withColumn(
-            "spoken_languages", concat_ws("|", col("spoken_languages.english_name"))
+    if "spoken_languages" in columns:
+        select_exprs.append(
+            concat_ws("|", col("spoken_languages.english_name")).alias(
+                "spoken_languages"
+            )
         )
 
-    # production_countries
-    if "production_countries" in movies_df.columns:
-        movies_df = movies_df.withColumn(
-            "production_countries", concat_ws("|", col("production_countries.name"))
+    if "production_countries" in columns:
+        select_exprs.append(
+            concat_ws("|", col("production_countries.name")).alias(
+                "production_countries"
+            )
         )
 
-    # production_companies
-    if "production_companies" in movies_df.columns:
-        movies_df = movies_df.withColumn(
-            "production_companies", concat_ws("|", col("production_companies.name"))
+    if "production_companies" in columns:
+        select_exprs.append(
+            concat_ws("|", col("production_companies.name")).alias(
+                "production_companies"
+            )
         )
 
-    # Credits extraction
-    if "credits" in movies_df.columns:
-        # Cast names
-        movies_df = movies_df.withColumn(
-            "cast", concat_ws("|", col("credits.cast.name"))
+    if "credits" in columns:
+        select_exprs.extend(
+            [
+                concat_ws("|", col("credits.cast.name")).alias("cast"),
+                size(col("credits.cast")).alias("cast_size"),
+                expr(
+                    "concat_ws('|', filter(credits.crew, x -> x.job = 'Director').name)"
+                ).alias("directors"),
+                size(col("credits.crew")).alias("crew_size"),
+            ]
         )
 
-        # Cast size
-        movies_df = movies_df.withColumn("cast_size", size(col("credits.cast")))
+    movies_df = movies_df.select(*select_exprs)
 
-        # Directors only
-        movies_df = movies_df.withColumn(
-            "directors",
-            expr("concat_ws('|', filter(credits.crew, x -> x.job = 'Director').name)"),
-        )
-
-        # Crew size
-        movies_df = movies_df.withColumn("crew_size", size(col("credits.crew")))
-
-        # Drop credits
+    if "credits" in columns:
         movies_df = movies_df.drop("credits")
 
     # Type conversions
-    for c in ["budget", "revenue", "runtime"]:
-        if c in movies_df.columns:
-            movies_df = movies_df.withColumn(c, col(c).cast(DoubleType()))
+    for c in {"budget", "revenue", "runtime"} & columns:
+        movies_df = movies_df.withColumn(c, when(col(c) > 0, col(c).cast(DoubleType())))
 
-    if "release_date" in movies_df.columns:
+    if "release_date" in columns:
         movies_df = movies_df.withColumn("release_date", to_date(col("release_date")))
 
-    # Replace unrealistic values
-    for c in ["budget", "revenue", "runtime"]:
-        if c in movies_df.columns:
-            movies_df = movies_df.withColumn(
-                c, when(col(c) <= 0, None).otherwise(col(c))
-            )
-
-    # Convert to millions
-    movies_df = movies_df.withColumn("budget_musd", col("budget") / 1_000_000)
-    movies_df = movies_df.withColumn("revenue_musd", col("revenue") / 1_000_000)
-    movies_df = movies_df.drop("budget", "revenue")
-
-    # Vote average cleanup
-    movies_df = movies_df.withColumn(
-        "vote_average",
-        when(col("vote_count") == 0, None).otherwise(col("vote_average")),
+    # Monetary normalization
+    movies_df = (
+        movies_df.withColumn("budget_musd", col("budget") / 1_000_000)
+        .withColumn("revenue_musd", col("revenue") / 1_000_000)
+        .drop("budget", "revenue")
     )
 
-    # Deduplication & validity
+    # Vote cleanup
+    if {"vote_average", "vote_count"} <= columns:
+        movies_df = movies_df.withColumn(
+            "vote_average", when(col("vote_count") > 0, col("vote_average"))
+        )
+
+    # Deduplication
     movies_df = movies_df.dropDuplicates(["id"]).dropna(subset=["id", "title"])
 
-    # Keep rows with ≥ 10 non-null values
-    non_na_count = reduce(
-        add,
-        [when(col(c).isNotNull(), lit(1)).otherwise(lit(0)) for c in movies_df.columns],
-    )
-    movies_df = movies_df.withColumn("non_na_count", non_na_count)
-    movies_df = movies_df.filter(col("non_na_count") >= 10).drop("non_na_count")
+    # Non-null threshold
+    non_null_cols = [col(c) for c in movies_df.columns]
 
-    # Released movies only
-    if "status" in movies_df.columns:
+    movies_df = (
+        movies_df.withColumn(
+            "non_na_count",
+            size(spark_filter(array(*non_null_cols), lambda x: x.isNotNull())),
+        )
+        .filter(col("non_na_count") >= 10)
+        .drop("non_na_count")
+    )
+
+    # Released only
+    if "status" in columns:
         movies_df = movies_df.filter(col("status") == "Released").drop("status")
 
     # Profit & ROI
-    movies_df = movies_df.withColumn("profit", col("revenue_musd") - col("budget_musd"))
-    movies_df = movies_df.withColumn("roi", col("revenue_musd") / col("budget_musd"))
+    movies_df = movies_df.withColumn(
+        "profit", col("revenue_musd") - col("budget_musd")
+    ).withColumn(
+        "roi",
+        when(
+            col("budget_musd").isNotNull() & (col("budget_musd") > 0),
+            col("revenue_musd") / col("budget_musd"),
+        ),
+    )
 
+    # Column ordering
     column_order = [
         "id",
         "title",
@@ -147,12 +144,6 @@ def clean_movie_data(df: DataFrame) -> DataFrame:
         "directors",
         "crew_size",
     ]
-    # Select only the columns that actually exist in the DataFrame
+
     final_columns = [c for c in column_order if c in movies_df.columns]
-    movies_df = movies_df.select(final_columns)
-
-    logger.info(
-        f"Cleaned data: {movies_df.count()} movies, {len(movies_df.columns)} columns"
-    )
-
-    return movies_df
+    return movies_df.select(final_columns)
